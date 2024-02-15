@@ -22,6 +22,7 @@ contract BoomTech is OwnableUpgradeable, ReentrancyGuardUpgradeable {
     uint256 public subjectFeePercent;
 
     uint256 public totalKeysSupply;
+    uint256 public totalEthForKeys;
     mapping(address => uint256) public keysSupply;
     mapping(address => mapping(address => uint256)) public keysBalance;
 
@@ -111,13 +112,14 @@ contract BoomTech is OwnableUpgradeable, ReentrancyGuardUpgradeable {
     }
 
     function updateYield(address subject) private {
-        uint256 eth = address(this).balance;
-        if (eth > lastYieldEth) {
+        uint256 ethForYield = address(this).balance - totalEthForKeys;
+        if (ethForYield > lastYieldEth) {
+            lastYieldEth = ethForYield;
             uint256 supply = keysSupply[subject];
-            if (supply > 0) {
-                accYieldPerUnit[subject] += ((eth - lastYieldEth) * supply) / totalKeysSupply;
-            }
-            lastYieldEth = eth;
+            if (supply > 0)
+                accYieldPerUnit[subject] +=
+                    ((ethForYield - lastYieldEth) * supply * ACC_YIELD_PRECISION) /
+                    totalKeysSupply;
             emit LogUpdateYield(subject, lastYieldEth, accYieldPerUnit[subject]);
         }
     }
@@ -136,15 +138,19 @@ contract BoomTech is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         totalKeysSupply += amount;
         keysSupply[subject] = supply;
 
-        updateYield(subject);
         yieldDebt[subject][msg.sender] += int256((amount * accYieldPerUnit[subject]) / ACC_YIELD_PRECISION);
 
+        uint256 ethForKeys = msg.value - protocolFee - subjectFee;
         protocolFeeDestination.sendValue(protocolFee);
         payable(subject).sendValue(subjectFee);
         if (msg.value > price + protocolFee + subjectFee) {
             uint256 refund = msg.value - price - protocolFee - subjectFee;
+            ethForKeys -= refund;
             payable(msg.sender).sendValue(refund);
         }
+
+        totalEthForKeys += ethForKeys;
+        updateYield(subject);
 
         emit Trade(msg.sender, subject, true, amount, price, protocolFee, subjectFee, supply);
     }
@@ -162,7 +168,6 @@ contract BoomTech is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         totalKeysSupply -= amount;
         keysSupply[subject] = supply;
 
-        updateYield(subject);
         yieldDebt[subject][msg.sender] -= int256((amount * accYieldPerUnit[subject]) / ACC_YIELD_PRECISION);
 
         uint256 netAmount = price - protocolFee - subjectFee;
@@ -170,14 +175,17 @@ contract BoomTech is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         protocolFeeDestination.sendValue(protocolFee);
         payable(subject).sendValue(subjectFee);
 
+        totalEthForKeys -= price;
+        updateYield(subject);
+
         emit Trade(msg.sender, subject, false, amount, price, protocolFee, subjectFee, supply);
     }
 
     function claimableYield(address subject, address holder) external view returns (uint256 claimable) {
         uint256 acc = accYieldPerUnit[subject];
-        uint256 eth = address(this).balance;
-        if (eth > lastYieldEth) {
-            acc += ((eth - lastYieldEth) * keysSupply[subject]) / totalKeysSupply;
+        uint256 ethForYield = address(this).balance - totalEthForKeys;
+        if (ethForYield > lastYieldEth) {
+            acc += ((ethForYield - lastYieldEth) * keysSupply[subject] * ACC_YIELD_PRECISION) / totalKeysSupply;
         }
         claimable = uint256(
             int256((keysBalance[subject][holder] * acc) / ACC_YIELD_PRECISION) - yieldDebt[subject][holder]
@@ -185,16 +193,17 @@ contract BoomTech is OwnableUpgradeable, ReentrancyGuardUpgradeable {
     }
 
     function claimYield(address subject) external nonReentrant {
-        updateYield(subject);
-
         int256 acc = int256((keysBalance[subject][msg.sender] * accYieldPerUnit[subject]) / ACC_YIELD_PRECISION);
         uint256 claimable = uint256(acc - yieldDebt[subject][msg.sender]);
 
         yieldDebt[subject][msg.sender] = acc;
 
         if (claimable > 0) {
+            lastYieldEth -= claimable;
             payable(msg.sender).sendValue(claimable);
         }
+
+        updateYield(subject);
 
         emit ClaimYield(subject, msg.sender, claimable);
     }
@@ -212,15 +221,18 @@ contract BoomTech is OwnableUpgradeable, ReentrancyGuardUpgradeable {
         totalKeysSupply -= amount;
         keysSupply[subject] = supply;
 
-        updateYield(subject);
         int256 acc = int256((amount * accYieldPerUnit[subject]) / ACC_YIELD_PRECISION);
         uint256 claimable = uint256(acc - yieldDebt[subject][msg.sender]);
+
         yieldDebt[subject][msg.sender] = acc;
+        if (claimable > 0) lastYieldEth -= claimable;
 
         uint256 netAmount = price - protocolFee - subjectFee;
         payable(msg.sender).sendValue(netAmount + claimable);
         protocolFeeDestination.sendValue(protocolFee);
         payable(subject).sendValue(subjectFee);
+
+        updateYield(subject);
 
         emit Trade(msg.sender, subject, false, amount, price, protocolFee, subjectFee, supply);
         emit ClaimYield(subject, msg.sender, claimable);
